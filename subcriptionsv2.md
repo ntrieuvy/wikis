@@ -1,122 +1,61 @@
-# Báo cáo Kỹ thuật Subscription/Payment (As-Implemented)
 
-## 1) Mục tiêu nghiệp vụ
+# SPEC HỆ THỐNG SUBSCRIPTION
 
-- Chuẩn hóa domain cho `catalog/pricing/order/payment/entitlement/credit`.
-- Hỗ trợ đầy đủ mua gói, mua thêm, retry/cancel, voucher, profile paid-flow.
-- Triển khai flow check entitlement theo phiên đăng tin:
-  - reserve token
-  - rollback token
-  - commit token
-  - tính phí phát sinh từ pricing rule.
-- Bổ sung free-token trọn đời theo `user + loại tin` và quy tắc tăng vĩnh viễn `image_token` khi mua extra image.
-- Xây dựng admin console để vận hành nghiệp vụ:
-  - tạo order nâng cấp cho user
-  - approve tin với checkout phí phát sinh thay user.
+## 1) Mục tiêu
 
-Phạm vi: **Backend (BE)**.
+Tài liệu này là mô tả kỹ thuật chính cho hệ thống Subscription/Entitlement/Payment hiện tại:
+
+* Chuẩn hóa flow mua gói và cấp quyền lợi.
+* Chuẩn hóa flow check-reserve-release-commit token cho listing.
+* Đảm bảo không double charge, không over-reserve, có audit đầy đủ.
+* Chốt quy tắc `quantity_remaining = NULL` là unlimited (không dùng `is_unlimited`).
 
 ---
 
-## 2) Kiến trúc tổng thể hiện tại
+## 2) Nguyên tắc domain
 
-```mermaid
-flowchart LR
-    catalog[Service Catalog + PricingRule] --> preview[Order Preview]
-    preview --> createOrder[Create Order pending_payment]
-    createOrder --> qr[Create Payment QR]
-    qr --> vqr[VietQR]
-    vqr --> callback[Transaction Sync Callback]
-    callback --> paid[Update payment + order paid]
-    paid --> grant[Grant UserService/UserServiceFeature]
-    grant --> credit[Build UserCreditBalance]
-    credit --> ledger[Usage Logs]
-    paid --> profilePaid[Mark profile update paid]
+### 2.1 Single source of truth
 
-    listing[Create Listing Draft] --> entCheck[Entitlements Check]
-    entCheck --> reserve[Reserve token FEFO]
-    reserve --> checkoutExtra[Checkout extra pricing]
-    checkoutExtra --> commit[Commit reserved token]
-    entCheck --> release[Release reserved token]
+* Số dư token của user: `UserCreditBalance`.
+* Baseline token đã charge theo listing: `ListingTokenCharge`.
+* Log/session chỉ dùng để audit và điều khiển state, không dùng để suy diễn lại baseline.
 
-    checkoutExtra --> freeImage[Increase free image token forever]
-```
+### 2.2 Unlimited
 
-### 2.1 Các lớp nghiệp vụ
+* Unlimited được biểu diễn bằng `quantity_remaining IS NULL`.
+* Service feature unlimited được biểu diễn bằng `ServiceFeature.quantity IS NULL`.
 
-- **Catalog/Pricing layer**: `Service`, `ServiceFeature`, `PricingRule`.
-- **Order layer**: `OrderService`, `OrderDetailService`, idempotent create, retry/cancel.
-- **Payment layer**: `Payment`, `PaymentTransaction`, webhook idempotent.
-- **Entitlement layer**: `UserService`, `UserServiceFeature`, `UserCreditBalance`.
-- **Ledger layer**: `UserServiceUsageLogs` với action `allocate/reserve/release/consume/...`.
-- **Free-token layer**: `UserFreeListingToken` theo `user + target_type`.
-- **Admin operation layer**:
-  - `Subscription Console` trong service admin
-  - `Approve Listing Checkout` trong market admin.
+### 2.3 Tính token theo delta
+
+Công thức bắt buộc:
+
+`requested_delta = max(requested_now - charged_baseline, 0)`
+
+Ý nghĩa:
+
+* Chỉ tính token cho phần tăng mới.
+* Không charge lại phần đã trả ở các lần cập nhật trước.
+* Không refund tự động khi user giảm số lượng.
 
 ---
 
-## 3) Sequence các luồng chính
+## 3) Mô hình dữ liệu
 
-## 3.1 Mua gói chuẩn + thanh toán
+### 3.1 Bảng chính
 
-```mermaid
-sequenceDiagram
-    participant FE
-    participant ServiceAPI
-    participant PaymentAPI
-    participant VietQR
-    participant DB
+* `service_service`: định nghĩa sản phẩm/gói.
+* `service_servicefeature`: quyền lợi theo feature (`post`, `image`, `video`, `posting_service`).
+* `service_pricingrule`: bảng giá server-side.
+* `service_orderservice`, `service_orderdetailservice`: đơn hàng và item.
+* `service_userservice`, `service_userservicefeature`: quyền lợi đã cấp cho user.
+* `service_usercreditbalance`: số dư token tiêu thụ theo FEFO.
+* `service_userserviceusagelogs`: reserve/release/consume audit log.
+* `service_listingfreetokenconfig`: free quota dùng chung theo `target_type`.
+* `service_listingtokencharge`: baseline đã charge theo listing.
+* `service_entitlementreservationsession`: session reserve theo `ref_token_id`, có TTL.
+* `payment_payment`, `payment_paymenttransaction`: payment gateway integration.
 
-    FE->>ServiceAPI: POST /service/orders/preview
-    ServiceAPI->>DB: read service/voucher
-    ServiceAPI-->>FE: subtotal/discount/total
-
-    FE->>ServiceAPI: POST /service/service-packages/orders/create
-    ServiceAPI->>DB: insert order + order_detail (+voucher pending)
-    ServiceAPI-->>FE: order pending_payment
-
-    FE->>PaymentAPI: POST /api/v1/payments/qr
-    PaymentAPI->>VietQR: generate transaction
-    VietQR-->>PaymentAPI: transactionRefId + qr
-    PaymentAPI->>DB: insert payment + payment_transaction(created)
-    PaymentAPI-->>FE: qr info
-
-    VietQR->>PaymentAPI: POST /vqr/bank/api/transaction-sync
-    PaymentAPI->>DB: update tx/payment/order paid
-    PaymentAPI->>DB: grant entitlement + credit + usage logs
-    PaymentAPI->>DB: complete voucher / mark profile paid
-```
-
-## 3.2 Check entitlement cho phiên đăng tin (reserve/release/commit)
-
-```mermaid
-sequenceDiagram
-    participant FE
-    participant ServiceAPI
-    participant DB
-
-    FE->>ServiceAPI: POST /service/entitlements/check (reserve_tokens=true)
-    ServiceAPI->>DB: read free_token(user+type)
-    ServiceAPI->>DB: read/lock credits FEFO
-    ServiceAPI->>DB: reserve token + write reserve logs
-    ServiceAPI->>DB: read pricing_rule for missing
-    ServiceAPI-->>FE: ref_token_id + remaining_required + pricing
-
-    alt user cancel/reject/timeout
-      FE->>ServiceAPI: POST /service/entitlements/release
-      ServiceAPI->>DB: rollback token + write release logs
-      ServiceAPI-->>FE: released summary
-    else publish/checkout success
-      FE->>ServiceAPI: POST /service/entitlements/commit
-      ServiceAPI->>DB: write consume logs from reserve logs
-      ServiceAPI-->>FE: consumed summary
-    end
-```
-
----
-
-## 4) ER diagram cập nhật
+### 3.2 ER Diagram
 
 ```mermaid
 erDiagram
@@ -125,205 +64,297 @@ erDiagram
     SERVICE ||--o{ SERVICE_FEATURE : has
     PRICING_RULE ||--o{ ORDER_DETAIL_SERVICE : prices
 
-    ORDER_SERVICE ||--o{ PAYMENT : has
-    PAYMENT ||--o{ PAYMENT_TRANSACTION : has
-    PAYMENT_TRANSACTION ||--o{ PAYMENT_TRANSACTION_LOG : logs
-
     ORDER_DETAIL_SERVICE ||--o{ USER_SERVICE : grants
     USER_SERVICE ||--o{ USER_SERVICE_FEATURE : expands
     USER_SERVICE_FEATURE ||--o{ USER_CREDIT_BALANCE : source
     USER_SERVICE ||--o{ USER_SERVICE_USAGE_LOGS : audit
 
-    CORE_USER ||--o{ USER_FREE_LISTING_TOKEN : owns
+    CORE_USER ||--o{ LISTING_TOKEN_CHARGE : owns
+    CORE_USER ||--o{ ENTITLEMENT_RESERVATION_SESSION : owns
+    LISTING_FREE_TOKEN_CONFIG ||--o{ ENTITLEMENT_RESERVATION_SESSION : pricing_context
 
-    VOUCHER ||--o{ VOUCHER_USAGE : usage
-    ORDER_SERVICE ||--o| VOUCHER_USAGE : links
-    ORDER_SERVICE ||--o| VOUCHER_ORDER : discount
+    ORDER_SERVICE ||--o{ PAYMENT : has
+    PAYMENT ||--o{ PAYMENT_TRANSACTION : has
 ```
 
 ---
 
-## 5) Thay đổi schema và ý nghĩa
+## 4) State machine
 
-## 5.1 Service domain
+### 4.1 Session state
 
-### `Service`
-- Có `code`, `target_type`, `billing_unit`, `entitlement_mode`, `purchase_policy`, `is_stackable`.
-- Mục đích: mô tả sản phẩm/gói theo target và policy.
+| Từ        | Sang      | Hợp lệ |
+| --------- | --------- | ------ |
+| reserved  | committed | YES    |
+| reserved  | released  | YES    |
+| committed | released  | NO     |
+| released  | committed | NO     |
 
-### `PricingRule`
-- `scope`, `target_type`, `cycle`, `amount`, `currency`, `metadata`, `starts_at/ends_at`.
-- Mục đích: source-of-truth cho giá, không hardcode phía FE.
+### 4.2 TTL
 
-### `ServiceFeature`
-- Có `is_unlimited` (thay cho `image_lifetime` cũ), `reset_policy`, `expires_with_entitlement`.
-- Mục đích: mô hình quyền lợi linh hoạt + biểu diễn unlimited chuẩn.
+* `EntitlementReservationSession.expires_at` bắt buộc có giá trị khi reserve.
+* TTL mặc định: 10 phút.
+* Session `reserved` hết TTL sẽ được release bởi job định kỳ.
 
-### `OrderService`, `OrderDetailService`
-- Trạng thái chuẩn: `draft/pending_payment/paid/failed/canceled/expired`.
-- `scope_type` + `target_type` + `target_id` để trace tới account/profile/listing.
+Command:
 
-### `UserService`, `UserServiceFeature`, `UserCreditBalance`, `UserServiceUsageLogs`
-- Cấu trúc entitlement + credit pool + ledger đầy đủ.
-- `UserServiceUsageLogs.action` hỗ trợ `allocate/reserve/release/consume/...`.
-
-### `UserFreeListingToken` (mới)
-- Bảng lưu free token trọn đời theo `user + target_type`.
-- Field: `post_token`, `image_token`, `video_token`, `posting_service_token`.
-- Unique constraint: `(user, target_type)`.
-
-### Bootstrap free token cho user mới
-- Signal ở `src.service.signals`: khi tạo user, auto khởi tạo:
-  - `target_type=CHO_DUOC_PHAM`
-  - `post=1`, `image=3`, `video=0`, `posting_service=0`.
-
-## 5.2 Payment domain
-
-### `Payment`
-- Thêm `provider`, `idempotency_key`, `external_ref`, `metadata`.
-- Sẵn sàng đa cổng + đối soát + chống lặp.
-
-### `PaymentTransaction`
-- Có `idempotency_key`, `metadata`, `raw_data`.
-- Callback xử lý idempotent và tránh duplicate trạng thái paid.
-
-## 5.3 Voucher domain
-
-### `Voucher`
-- `code` cho phép blank và tự sinh.
-- Hỗ trợ manual/auto code.
-
-### `VoucherUsage`, `VoucherOrder`
-- Theo dõi pending/completed/canceled usage và discount applied theo order.
-
-## 5.4 Profile paid-flow
-
-- `DoctorProfileUpdateRequest` và `MedicalFacilityProfileUpdateRequest` có `is_paid`, `payment_status`.
-- Sau callback paid, service `mark_profile_updates_paid` cập nhật trạng thái.
+`python manage.py release_expired_entitlement_sessions --limit 500`
 
 ---
 
-## 6) API contract hiện tại
+## 5) API contract chính
 
 Base: `api/v1/service/`
 
-### Catalog/Pricing
-- `GET /catalog`
-- `GET /service-packages/`
-- `GET /service-packages/{id}`
+### 5.1 Order
 
-### Order
-- `POST /orders/preview`
-- `POST /service-packages/orders/create`
-- `GET /service-packages/orders/pending`
-- `GET /orders`
-- `GET /orders/{id}`
-- `POST /orders/{id}/retry`
-- `POST /orders/{id}/cancel`
+* `POST /orders/preview`
+* `POST /service-packages/orders/create`
+* `POST /orders/{id}/retry`
+* `POST /orders/{id}/cancel`
+* `GET /orders`, `GET /orders/{id}`
 
-### Entitlement/Credit/History
-- `GET /entitlements`
-- `GET /credits`
-- `POST /entitlements/check`
-- `POST /entitlements/release`
-- `POST /entitlements/commit`
-- `GET /transactions/history`
-- `GET /payments/history`
-- `GET /profile-payables`
+### 5.2 Entitlement
 
-### Payment gateway
-- `POST /api/v1/payments/qr`
-- `POST /vqr/bank/api/transaction-sync`
+* `POST /entitlements/check`
+* `POST /entitlements/release`
+* `POST /entitlements/commit`
+* `GET /entitlements`
+* `GET /credits`
+
+### 5.3 Payment
+
+* `POST /api/v1/payments/qr`
+* `POST /vqr/bank/api/transaction-sync`
 
 ---
 
-## 7) Flow `entitlements/check` (đã triển khai)
+## 6) Flow 1 - User mua gói dịch vụ
 
-## 7.1 Mục tiêu
-- Check khả năng đăng tin theo token.
-- Trả thiếu (`remaining_required`) + pricing fallback.
-- Hỗ trợ reserve token cho một phiên đăng tin và rollback/commit theo `ref_token_id`.
+### 6.1 Sequence diagram
 
-## 7.2 Thuật toán
-1. Xác định group theo `type/target`.
-2. Đọc free token trọn đời (`UserFreeListingToken`) theo `user + pricing_target_type`.
-3. Tính:
-   - `required_after_free = max(requested - free_token, 0)`
-4. Lấy credits còn hạn, sort FEFO (`expires_at ASC`).
-5. Reserve token theo thứ tự FEFO.
-6. Tính:
-   - `remaining_required = max(required_after_free - reserved, 0)`
-7. Map pricing:
-   - `post -> POSTING_FEE_30_DAYS_{TARGET}`
-   - `image -> EXTRA_IMAGE`
-   - `video -> EXTRA_VIDEO`
+```mermaid
+sequenceDiagram
+    participant FE as User FE
+    participant S as Service API
+    participant P as Payment API
+    participant V as VietQR
+    participant DB as Database
 
-## 7.3 Cơ chế rollback/commit
-- `POST /entitlements/release`: hoàn token đã reserve + ghi `action=release`.
-- `POST /entitlements/commit`: chốt tiêu hao qua `action=consume` (không trừ thêm quantity).
+    FE->>S: POST /orders/preview
+    S->>DB: Read service + pricing + voucher
+    S-->>FE: Preview(total, discount)
 
----
+    FE->>S: POST /service-packages/orders/create
+    S->>DB: Insert OrderService + OrderDetailService
+    S-->>FE: order_id, status=pending_payment
 
-## 8) Quy tắc free image tăng vĩnh viễn
+    FE->>P: POST /payments/qr
+    P->>V: generate QR/transaction
+    V-->>P: transaction_ref
+    P->>DB: Insert Payment + PaymentTransaction
+    P-->>FE: qr_link
 
-- Khi checkout extra có `feature_type=image` và thanh toán thành công:
-  - Tăng `UserFreeListingToken.image_token` theo `target_type`.
+    V->>P: callback transaction-sync
+    P->>DB: Update payment/order paid
+    P->>DB: create_user_service_after_payment(order_id)
+    P->>DB: Allocate UserServiceFeature + UserCreditBalance
+```
 
-Đã áp dụng tại:
-- flow **admin approve checkout** (`src/market/admin.py`)
-- callback payment (`src/payment/view/transaction_sync_view.py`) khi order metadata có `pricing + target_type`.
+### 6.2 Ghi dữ liệu chính
 
----
+* Đơn hàng: `OrderService`, `OrderDetailService`.
+* Thanh toán: `Payment`, `PaymentTransaction`.
+* Quyền lợi sau paid:
 
-## 9) Cập nhật zone Admin
+  * `UserService`
+  * `UserServiceFeature`
+  * `UserCreditBalance`
+  * `UserServiceUsageLogs(action=allocate)`
 
-## 9.1 Service admin
-- `Subscription Console` trong `OrderServiceAdmin`:
-  - tạo order theo user/scope
-  - auto tạo QR
-  - auto mark paid + cấp quyền lợi
-  - xem nhanh order/user_service/credit.
-- Admin mới cho `UserFreeListingToken` để vận hành free quota.
+### 6.3 Quy tắc unlimited khi cấp quyền lợi
 
-## 9.2 Market admin
-- Mỗi tin đăng có flow `Approve Listing Checkout`:
-  1. Check entitlement + reserve token
-  2. Hiển thị pricing thiếu như FE
-  3. Admin checkout thay user
-  4. Commit token
-  5. Approve publish
-- Có nút release reservation nếu hủy duyệt.
+* Nếu `ServiceFeature.quantity IS NULL`:
+
+  * `UserServiceFeature.quantity_remaining = NULL`
+  * `UserCreditBalance.quantity_remaining = NULL`
 
 ---
 
-## 10) Mapping model -> table
+## 7) Flow 2 - Đăng tin mới (check-reserve-payment-commit)
 
-- `Service` -> `service_service`
-- `ServiceFeature` -> `service_servicefeature`
-- `PricingRule` -> `service_pricingrule`
-- `OrderService` -> `service_orderservice`
-- `OrderDetailService` -> `service_orderdetailservice`
-- `UserService` -> `service_userservice`
-- `UserServiceFeature` -> `service_userservicefeature`
-- `UserCreditBalance` -> `service_usercreditbalance`
-- `UserFreeListingToken` -> `service_userfreelistingtoken`
-- `UserServiceUsageLogs` -> `service_userserviceusagelogs`
-- `Payment` -> `payment_payment`
-- `PaymentTransaction` -> `payment_paymenttransaction`
-- `PaymentTransactionLog` -> `payment_paymenttransactionlog`
-- `Voucher` -> `voucher_voucher`
-- `VoucherUsage` -> `voucher_voucherusage`
-- `VoucherOrder` -> `voucher_voucherorder`
+### 7.1 Sequence diagram
+
+```mermaid
+sequenceDiagram
+    participant FE as User FE
+    participant S as Service API
+    participant DB as Database
+
+    FE->>S: POST /entitlements/check (type,target,listing_ref,post,image,video)
+    S->>DB: Lock ListingTokenCharge (baseline theo listing)
+    S->>DB: Read ListingFreeTokenConfig
+    S->>DB: Lock UserCreditBalance FEFO
+    S->>DB: Reserve token + logs(action=reserve)
+    S->>DB: Insert EntitlementReservationSession(status=reserved, expires_at)
+    S-->>FE: ref_token_id, reserved, remaining_required, pricing
+
+    alt User hủy hoặc back
+      FE->>S: POST /entitlements/release
+      S->>DB: Rollback balance + logs(action=release)
+      S->>DB: session -> released
+      S-->>FE: released summary
+    else User thanh toán phí phát sinh và lưu tin thành công
+      FE->>S: POST /entitlements/commit
+      S->>DB: logs(action=consume)
+      S->>DB: Update ListingTokenCharge += requested_delta
+      S->>DB: session -> committed
+      S-->>FE: consumed summary
+    end
+```
+
+### 7.2 Công thức tính token
+
+1. `requested`: token listing cần hiện tại (post/image/video).
+2. `charged_baseline`: đọc từ `ListingTokenCharge`.
+3. `requested_delta = max(requested - charged_baseline, 0)`.
+4. `free_applied = min(requested_delta, free_quota)`.
+5. `required_after_free = requested_delta - free_applied`.
+6. Reserve theo FEFO trên `UserCreditBalance`.
+7. `remaining_required` → tính phí phát sinh bằng `PricingRule`.
 
 ---
 
-## 11) Tóm tắt đáp ứng yêu cầu mới
+## 8) Flow 3 - Cập nhật tin đăng (thêm/xóa ảnh-video)
 
-- [x] API `POST /api/v1/service/entitlements/check`
-- [x] FEFO reserve token + pricing fallback
-- [x] `ref_token_id` để rollback/commit theo phiên
-- [x] Table free token trọn đời theo `user + type`
-- [x] Mặc định user mới có free token (`CHO_DUOC_PHAM: post=1,image=3`)
-- [x] Extra image làm tăng free image vĩnh viễn
-- [x] Admin flow approve tin có checkout phát sinh thay user
-- [x] Report/diagram/flow đồng bộ trạng thái triển khai hiện tại
+### 8.1 Mục tiêu
+
+* Không charge lại phần token đã thanh toán trước.
+* Chỉ charge phần tăng mới vượt baseline.
+
+### 8.2 Ví dụ image
+
+* Baseline hiện tại: `charged_image = 5`.
+* User update listing lên 7 image.
+* `requested_delta = max(7 - 5, 0) = 2`.
+* Hệ thống chỉ reserve/charge cho 2 image tăng thêm.
+* Sau commit: `charged_image = 7`.
+
+### 8.3 Ví dụ giảm rồi tăng lại
+
+* Baseline `charged_image = 7`.
+* Giảm xuống 4: `requested_delta = 0`.
+* Tăng lên 6: `requested_delta = 0`.
+* Tăng lên 9: `requested_delta = 2` (chỉ charge thêm 2).
+
+### 8.4 Video và posting_service
+
+* Video áp dụng y hệt image qua `charged_video`.
+* `posting_service` đã có cột `charged_posting_service` để mở rộng cùng pattern.
+
+---
+
+## 9) Pricing
+
+* Không hardcode giá trong service code.
+* Tất cả lấy từ `PricingRule`.
+* Mapping chính hiện tại:
+
+  * post → `POSTING_FEE_30_DAYS_{TARGET}`
+  * image → `EXTRA_IMAGE`
+  * video → `EXTRA_VIDEO`
+
+---
+
+## 10) Concurrency, transaction, idempotency
+
+### 10.1 Concurrency control
+
+* Lock bắt buộc:
+
+  * `EntitlementReservationSession`
+  * `UserCreditBalance`
+  * `ListingTokenCharge`
+
+### 10.2 Transaction boundary
+
+* Mỗi flow nằm trong 1 transaction:
+
+  * check + reserve
+  * release
+  * commit
+
+### 10.3 Idempotency
+
+* `ref_token_id` là unique key cho phiên.
+* Retry check với cùng context/requested:
+
+  * không reserve lại,
+  * trả lại payload session đã có.
+* Retry release/commit:
+
+  * follow state machine, trả kết quả idempotent.
+
+---
+
+## 11) Audit và truy vết
+
+### 11.1 Tracking key
+
+* Tất cả flow reserve/release/consume đều gắn `ref_token_id` trong:
+
+  * `EntitlementReservationSession.ref_token_id`
+  * `UserServiceUsageLogs.idempotency_key`
+  * `ListingTokenCharge.last_ref_token_id`
+
+### 11.2 Truy vết một listing đã charge bao nhiêu
+
+SQL:
+
+```sql
+SELECT
+  user_id,
+  target_type,
+  listing_ref_type,
+  listing_ref_id,
+  charged_post,
+  charged_image,
+  charged_video,
+  charged_posting_service,
+  last_ref_token_id,
+  updated_at
+FROM service_listingtokencharge
+WHERE user_id = :user_id
+  AND listing_ref_type = :listing_ref_type
+  AND listing_ref_id = :listing_ref_id;
+```
+
+---
+
+## 12) Checklist QA
+
+* Reserve không overdraw số dư credit.
+* Retry check cùng `ref_token_id` không tạo session mới.
+* Session hết TTL được release bởi command.
+* Commit sau release bị chặn.
+* Release sau commit bị chặn.
+* Update listing không bị charge lại token đã trả.
+* Pricing fallback đọc từ `PricingRule`.
+
+---
+
+## 13) File code liên quan
+
+* Core logic: `src/service/services/entitlement_check.py`
+* Cấp quyền lợi sau paid: `src/service/services/userservice.py`
+* Models: `src/service/models.py`
+* APIs: `src/service/views.py`, `src/service/serializers.py`
+* Admin ops: `src/service/admin.py`, `src/market/admin.py`
+* TTL command: `src/service/management/commands/release_expired_entitlement_sessions.py`
+
+---
+
+## 14) Ghi chú vận hành
+
+* Sau khi deploy code mới:
+  1. Cấu hình scheduler chạy command release TTL (1–5 phút/lần).
