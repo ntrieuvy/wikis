@@ -184,11 +184,11 @@ BE map phần thiếu sang các pricing:
   "pricing": [
     {
       "code": "POSTING_FEE_30_DAYS_CHO_DUOC_PHAM",
-      "quantity": 1
+      ....
     },
     {
       "code": "EXTRA_IMAGE",
-      "quantity": 2
+      ....
     }
   ]
 }
@@ -293,15 +293,15 @@ post: thiếu 1
   "pricing": [
     {
       "code": "POSTING_FEE_30_DAYS_BACSY",
-      "quantity": 1
+      ....
     },
     {
       "code": "EXTRA_IMAGE",
-      "quantity": 4
+      ....
     },
     {
       "code": "EXTRA_VIDEO",
-      "quantity": 1
+      .....
     }
   ]
 }
