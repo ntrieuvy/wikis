@@ -2,7 +2,7 @@
 
 ## Tổng quan
 
-App `src.gov_reporting` cung cấp 3 API báo cáo số liệu cho Bộ Công Thương (MOIT):
+App `src.gov_reporting` cung cấp 3 API:
 
 1. **Statistics API**: Báo cáo chi tiết các chỉ tiêu theo khoảng thời gian tùy chỉnh
 2. **Summary API**: Báo cáo tóm tắt so sánh số liệu cho dashboard
